@@ -1,74 +1,63 @@
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from pydub import AudioSegment
 import os
-import subprocess
 
-TOKEN = os.environ.get("TOKEN")
+TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # جایگزین کن
+DB_FILE = "users.db"
 
-# /start
+# ایجاد دیتابیس و جدول کاربران
+conn = sqlite3.connect(DB_FILE)
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS users
+             (user_id INTEGER PRIMARY KEY, points INTEGER DEFAULT 0, voices_used INTEGER DEFAULT 0)''')
+conn.commit()
+conn.close()
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("سلام! 🎤 یک ویس بفرست تا صداتو تغییر بدم.")
-
-# دریافت ویس
-async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file = await update.message.voice.get_file()
-    file_path = "input.ogg"
-    await file.download_to_drive(file_path)
-    
-    context.user_data["voice_file"] = file_path
+    user_id = update.effective_user.id
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
+    conn.commit()
+    c.execute("SELECT points, voices_used FROM users WHERE user_id=?", (user_id,))
+    points, voices_used = c.fetchone()
+    conn.close()
 
     keyboard = [
-        [InlineKeyboardButton("مرد", callback_data="male")],
-        [InlineKeyboardButton("زن", callback_data="female")],
-        [InlineKeyboardButton("بچه", callback_data="child")],
-        [InlineKeyboardButton("روح", callback_data="ghost")]
+        [InlineKeyboardButton("مرد", callback_data="male"),
+         InlineKeyboardButton("زن", callback_data="female")],
+        [InlineKeyboardButton("کودک", callback_data="child"),
+         InlineKeyboardButton("روح", callback_data="ghost")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("میخوای صداتو به چی تغییر بدم؟", reply_markup=reply_markup)
 
-# تغییر pitch با ffmpeg
-def pitch_shift_ffmpeg(input_path: str, output_path: str, semitones: float):
-    # semitones مثبت → زیرتر، منفی → بم‌تر
-    subprocess.run([
-        "ffmpeg", "-y", "-i", input_path,
-        "-filter:a", f"asetrate=44100*2^{semitones/12},aresample=44100", 
-        output_path
-    ], check=True)
+    await update.message.reply_text(
+        f"سلام!\nامتیاز شما: {points}\nویس استفاده شده: {voices_used}\nکدوم صدا رو میخوای؟",
+        reply_markup=reply_markup
+    )
 
-# انتخاب دکمه
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     choice = query.data
-    file_path = context.user_data.get("voice_file")
-    
-    if not file_path:
-        await query.edit_message_text("ویسی پیدا نشد. لطفا دوباره ویس بفرست.")
-        return
 
-    output_path = "output.ogg"
+    # اینجا تبدیل صدا انجام میشه
+    voice_path = os.path.join("voices", f"{choice}.mp3")
+    if os.path.exists(voice_path):
+        await query.edit_message_text(text=f"صدا انتخاب شد: {choice}")
+        # میتونی اینجا صدا رو پردازش کنی و ویس خروجی بسازی
+    else:
+        await query.edit_message_text(text="صدا موجود نیست!")
 
-    if choice == "male":
-        pitch_shift_ffmpeg(file_path, output_path, semitones=-4)
-    elif choice == "female":
-        pitch_shift_ffmpeg(file_path, output_path, semitones=4)
-    elif choice == "child":
-        pitch_shift_ffmpeg(file_path, output_path, semitones=7)
-    elif choice == "ghost":
-        pitch_shift_ffmpeg(file_path, output_path, semitones=-12)  # خیلی بم و وهم‌آلود
-
-    await query.edit_message_text(f"صداتو به حالت '{choice}' تغییر دادم!")
-    await query.message.reply_voice(voice=open(output_path, "rb"))
-
-# اجرای ربات
-def main():
+async def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.VOICE, voice_handler))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    print("ربات روشن شد ...")
-    app.run_polling()
+    app.add_handler(CallbackQueryHandler(button))
+    await app.start_polling()
+    await app.idle()
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
