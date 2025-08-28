@@ -1,63 +1,109 @@
-import sqlite3
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-from pydub import AudioSegment
-import os
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import requests
+from fastapi import FastAPI, Request
+from threading import Thread
 
-TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # جایگزین کن
-DB_FILE = "users.db"
+# ----------- تنظیمات ربات و درگاه -----------
+TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+ZARINPAL_MERCHANT_ID = "YOUR_MERCHANT_ID"
+ZARINPAL_CALLBACK_URL = "https://YOUR_RAILWAY_URL/payment_callback"
 
-# ایجاد دیتابیس و جدول کاربران
-conn = sqlite3.connect(DB_FILE)
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS users
-             (user_id INTEGER PRIMARY KEY, points INTEGER DEFAULT 0, voices_used INTEGER DEFAULT 0)''')
-conn.commit()
-conn.close()
+# ----------- دیتابیس ساده با دیکشنری -----------
+users = {}  # {user_id: {"credits": 0, "voice_count": 0, "voice_type": "male"}}
+
+# ----------- FastAPI برای وب‌هوک پرداخت -----------
+app_api = FastAPI()
+
+@app_api.get("/payment_callback")
+async def payment_callback(request: Request):
+    user_id = int(request.query_params.get("user_id"))
+    status = request.query_params.get("Status")
+    authority = request.query_params.get("Authority")
+
+    if status == "OK":
+        users.setdefault(user_id, {"credits": 0, "voice_count": 0, "voice_type": "male"})
+        users[user_id]["credits"] += 200
+        return "پرداخت موفق! 200 امتیاز اضافه شد."
+    else:
+        return "پرداخت ناموفق!"
+
+def run_api():
+    import uvicorn
+    uvicorn.run(app_api, host="0.0.0.0", port=8000)
+
+# ----------- توابع ربات تلگرام -----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
-    conn.commit()
-    c.execute("SELECT points, voices_used FROM users WHERE user_id=?", (user_id,))
-    points, voices_used = c.fetchone()
-    conn.close()
-
+    user_id = update.message.from_user.id
+    users.setdefault(user_id, {"credits": 0, "voice_count": 0, "voice_type": "male"})
     keyboard = [
         [InlineKeyboardButton("مرد", callback_data="male"),
          InlineKeyboardButton("زن", callback_data="female")],
-        [InlineKeyboardButton("کودک", callback_data="child"),
+        [InlineKeyboardButton("بچه", callback_data="child"),
          InlineKeyboardButton("روح", callback_data="ghost")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        f"سلام!\nامتیاز شما: {points}\nویس استفاده شده: {voices_used}\nکدوم صدا رو میخوای؟",
-        reply_markup=reply_markup
-    )
+    await update.message.reply_text("سلام! صدای خود را انتخاب کنید:", reply_markup=reply_markup)
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    choice = query.data
+    user_id = query.from_user.id
+    users[user_id]["voice_type"] = query.data
+    await query.edit_message_text(text=f"صدای شما به {query.data} تغییر کرد!")
 
-    # اینجا تبدیل صدا انجام میشه
-    voice_path = os.path.join("voices", f"{choice}.mp3")
-    if os.path.exists(voice_path):
-        await query.edit_message_text(text=f"صدا انتخاب شد: {choice}")
-        # میتونی اینجا صدا رو پردازش کنی و ویس خروجی بسازی
+async def buy_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    amount = 10000  # تومان
+    description = f"خرید 200 امتیاز برای کاربر {user_id}"
+
+    data = {
+        "merchant_id": ZARINPAL_MERCHANT_ID,
+        "amount": amount,
+        "callback_url": f"{ZARINPAL_CALLBACK_URL}?user_id={user_id}",
+        "description": description,
+        "metadata": {"user_id": user_id}
+    }
+
+    response = requests.post("https://api.zarinpal.com/pg/v4/payment/request.json", json=data)
+    res_json = response.json()
+
+    if res_json["data"]["code"] == 100:
+        payment_url = "https://www.zarinpal.com/pg/StartPay/" + res_json["data"]["authority"]
+        await update.message.reply_text(f"برای پرداخت روی لینک زیر کلیک کنید:\n{payment_url}")
     else:
-        await query.edit_message_text(text="صدا موجود نیست!")
+        await update.message.reply_text("خطا در ایجاد پرداخت! دوباره امتحان کنید.")
+
+async def create_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user = users.get(user_id)
+    if not user:
+        await update.message.reply_text("ابتدا /start را بزنید.")
+        return
+
+    if user["voice_count"] >= user["credits"]:
+        await update.message.reply_text("امتیاز کافی ندارید! برای خرید امتیاز /buy را بزنید.")
+        return
+
+    # اینجا میتونی کد تبدیل صدا واقعی اضافه کنی
+    user["voice_count"] += 1
+    await update.message.reply_text(f"ویس ساخته شد! ({user['voice_count']}/{user['credits']} استفاده)")
+
+# ----------- اجرای ربات -----------
 
 async def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button))
-    await app.start_polling()
-    await app.idle()
+    app.add_handler(CommandHandler("buy", buy_credits))
+    app.add_handler(CommandHandler("voice", create_voice))
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await app.updater.idle()
 
 if __name__ == "__main__":
-    import asyncio
+    Thread(target=run_api).start()
     asyncio.run(main())
